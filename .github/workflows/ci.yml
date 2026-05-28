@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore
+        run: dotnet restore LoginApp.slnx
+
+      - name: Build
+        run: dotnet build LoginApp.slnx --no-restore --configuration Release
+
+      - name: Test
+        run: >
+          dotnet test LoginApp.slnx
+          --no-build
+          --configuration Release
+          --verbosity normal
+          /p:CollectCoverage=true
+          /p:CoverletOutputFormat=cobertura
+          /p:Threshold=85
+          /p:ThresholdType=line%2cbranch
