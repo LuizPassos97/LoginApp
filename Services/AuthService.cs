@@ -109,20 +109,42 @@ public class AuthService
              WHERE token_hash = @tokenHash
                AND revoked_at IS NULL
                AND expires_at > @now
-            RETURNING user_id;
+            RETURNING family_id;
             """;
         revoke.Parameters.AddWithValue("@revokedAt", now.ToString("o"));
         revoke.Parameters.AddWithValue("@tokenHash", tokenHash);
         revoke.Parameters.AddWithValue("@now", now.ToString("o"));
 
-        var userIdResult = await revoke.ExecuteScalarAsync();
-        if (userIdResult is null)
+        var familyId = await revoke.ExecuteScalarAsync() as string;
+        if (familyId is null)
         {
-            await tx.RollbackAsync();
+            // A revoked token is evidence of reuse, even if it has since expired.
+            // Keep this update in the rotation transaction so a competing exchange
+            // cannot insert a surviving descendant after revocation (fail-closed).
+            await using var revokeFamily = conn.CreateCommand();
+            revokeFamily.Transaction = (SqliteTransaction)tx;
+            revokeFamily.CommandText = """
+                UPDATE refresh_tokens
+                   SET revoked_at = @now
+                 WHERE revoked_at IS NULL
+                   AND (user_id, family_id) IN (
+                       SELECT user_id, family_id FROM refresh_tokens
+                        WHERE token_hash = @tokenHash AND revoked_at IS NOT NULL
+                   );
+                """;
+            revokeFamily.Parameters.AddWithValue("@now", now.ToString("o"));
+            revokeFamily.Parameters.AddWithValue("@tokenHash", tokenHash);
+            await revokeFamily.ExecuteNonQueryAsync();
+            await tx.CommitAsync();
             return (false, string.Empty, string.Empty);
         }
 
-        var user = await FindUserByIdAsync(Convert.ToInt32(userIdResult), conn, (SqliteTransaction)tx);
+        await using var owner = conn.CreateCommand();
+        owner.Transaction = (SqliteTransaction)tx;
+        owner.CommandText = "SELECT user_id FROM refresh_tokens WHERE token_hash = @tokenHash;";
+        owner.Parameters.AddWithValue("@tokenHash", tokenHash);
+        var userId = Convert.ToInt32(await owner.ExecuteScalarAsync());
+        var user = await FindUserByIdAsync(userId, conn, (SqliteTransaction)tx);
         if (user is null)
         {
             await tx.RollbackAsync();
@@ -130,7 +152,7 @@ public class AuthService
         }
 
         var newAccessToken = GenerateAccessToken(user);
-        var newRefreshToken = await CreateRefreshTokenAsync(user.Id, conn, (SqliteTransaction)tx);
+        var newRefreshToken = await CreateRefreshTokenAsync(user.Id, conn, (SqliteTransaction)tx, familyId);
         await tx.CommitAsync();
 
         return (true, newAccessToken, newRefreshToken);
@@ -205,13 +227,14 @@ public class AuthService
     private async Task<string> CreateRefreshTokenAsync(int userId)
     {
         await using var conn = await _db.OpenConnectionAsync();
-        return await CreateRefreshTokenAsync(userId, conn, null);
+        return await CreateRefreshTokenAsync(userId, conn, null, Guid.NewGuid().ToString("N"));
     }
 
     private async Task<string> CreateRefreshTokenAsync(
         int userId,
         SqliteConnection conn,
-        SqliteTransaction? tx)
+        SqliteTransaction? tx,
+        string familyId)
     {
         var token = GenerateOpaqueToken();
         var tokenHash = HashRefreshToken(token);
@@ -220,12 +243,13 @@ public class AuthService
         await using var cmd = conn.CreateCommand();
         cmd.Transaction = tx;
         cmd.CommandText = """
-            INSERT INTO refresh_tokens (user_id, token_hash, expires_at)
-            VALUES (@userId, @tokenHash, @expiresAt);
+            INSERT INTO refresh_tokens (user_id, token_hash, expires_at, family_id)
+            VALUES (@userId, @tokenHash, @expiresAt, @familyId);
             """;
         cmd.Parameters.AddWithValue("@userId", userId);
         cmd.Parameters.AddWithValue("@tokenHash", tokenHash);
         cmd.Parameters.AddWithValue("@expiresAt", expiresAt.ToString("o"));
+        cmd.Parameters.AddWithValue("@familyId", familyId);
         await cmd.ExecuteNonQueryAsync();
 
         return token;
