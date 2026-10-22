@@ -118,7 +118,7 @@ public class AuthService
         return (true, newAccessToken, newRefreshToken);
     }
 
-    public async Task RevokeRefreshTokenAsync(string token)
+    public async Task RevokeRefreshTokenAsync(string token, int userId)
     {
         await using var conn = await _db.OpenConnectionAsync();
 
@@ -126,10 +126,11 @@ public class AuthService
         cmd.CommandText = """
             UPDATE refresh_tokens
                SET revoked_at = @revokedAt
-             WHERE token_hash = @tokenHash AND revoked_at IS NULL;
+             WHERE token_hash = @tokenHash AND user_id = @userId AND revoked_at IS NULL;
             """;
         cmd.Parameters.AddWithValue("@revokedAt", DateTimeOffset.UtcNow.ToString("o"));
         cmd.Parameters.AddWithValue("@tokenHash", HashRefreshToken(token));
+        cmd.Parameters.AddWithValue("@userId", userId);
         await cmd.ExecuteNonQueryAsync();
     }
 

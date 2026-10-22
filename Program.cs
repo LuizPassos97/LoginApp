@@ -139,6 +139,12 @@ app.MapPost("/refresh", async (RefreshRequest req, AuthService auth) =>
 
 app.MapPost("/logout", async (LogoutRequest req, HttpContext ctx, AuthService auth, TokenBlocklist blocklist) =>
 {
+    var sub = ctx.User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)
+           ?? ctx.User.FindFirst("sub");
+
+    if (sub is null || !int.TryParse(sub.Value, out var userId))
+        return Results.Unauthorized();
+
     var jti = ctx.User.FindFirst(JwtRegisteredClaimNames.Jti)?.Value;
     var expClaim = ctx.User.FindFirst(JwtRegisteredClaimNames.Exp)?.Value;
 
@@ -149,7 +155,7 @@ app.MapPost("/logout", async (LogoutRequest req, HttpContext ctx, AuthService au
     }
 
     if (!string.IsNullOrWhiteSpace(req.RefreshToken))
-        await auth.RevokeRefreshTokenAsync(req.RefreshToken);
+        await auth.RevokeRefreshTokenAsync(req.RefreshToken, userId);
 
     return Results.NoContent();
 })

@@ -69,6 +69,59 @@ public sealed class AuthFlowTests
     }
 
     [Fact]
+    public async Task LogoutCannotRevokeAnotherUsersRefreshToken()
+    {
+        await using var app = new LoginAppFactory();
+        using var client = app.CreateClient();
+
+        await RegisterAsync(client, "alice@example.com", "s3cr3tpass");
+        await RegisterAsync(client, "bob@example.com", "s3cr3tpass");
+        var alice = await LoginAsync(client, "alice@example.com", "s3cr3tpass");
+        var bob = await LoginAsync(client, "bob@example.com", "s3cr3tpass");
+
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", alice.AccessToken);
+        var logout = await client.PostAsJsonAsync("/logout", new
+        {
+            refreshToken = bob.RefreshToken
+        });
+        Assert.Equal(HttpStatusCode.NoContent, logout.StatusCode);
+
+        var afterLogout = await client.GetAsync("/me");
+        Assert.Equal(HttpStatusCode.Unauthorized, afterLogout.StatusCode);
+
+        client.DefaultRequestHeaders.Authorization = null;
+        var refresh = await client.PostAsJsonAsync("/refresh", new
+        {
+            refreshToken = bob.RefreshToken
+        });
+        Assert.Equal(HttpStatusCode.OK, refresh.StatusCode);
+    }
+
+    [Fact]
+    public async Task LogoutRevokesTheAuthenticatedUsersRefreshToken()
+    {
+        await using var app = new LoginAppFactory();
+        using var client = app.CreateClient();
+
+        await RegisterAsync(client, "owner@example.com", "s3cr3tpass");
+        var tokens = await LoginAsync(client, "owner@example.com", "s3cr3tpass");
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", tokens.AccessToken);
+
+        var logout = await client.PostAsJsonAsync("/logout", new
+        {
+            refreshToken = tokens.RefreshToken
+        });
+        Assert.Equal(HttpStatusCode.NoContent, logout.StatusCode);
+
+        client.DefaultRequestHeaders.Authorization = null;
+        var refresh = await client.PostAsJsonAsync("/refresh", new
+        {
+            refreshToken = tokens.RefreshToken
+        });
+        Assert.Equal(HttpStatusCode.Unauthorized, refresh.StatusCode);
+    }
+
+    [Fact]
     public async Task ConcurrentRefreshRequestsOnlyConsumeTokenOnce()
     {
         await using var app = new LoginAppFactory();
