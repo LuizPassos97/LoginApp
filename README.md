@@ -84,9 +84,10 @@ known vulnerable package was reported by the consulted sources at that time.
 The integration and unit tests use an isolated SQLite database per test factory and cover:
 
 - register, login, authenticated `/me`, refresh rotation, and logout
-- concurrent refresh-token replay, where only one request can consume the token
+- concurrent refresh-token replay: only one exchange succeeds, then reuse invalidates its family (fail-closed)
 - refresh tokens are persisted as hashes, not plain text
-- refresh-token replay rejection
+- refresh-token family isolation across logins/users, descendant revocation on replay, and additive migration
+- logout with null, nonexistent, already revoked, and another user's refresh tokens
 - expired access token rejection
 - auth endpoint rate limiting
 - same `401` behavior for unknown email vs wrong password
@@ -137,6 +138,22 @@ of identical end-to-end timing.
 
 Exchange a valid refresh token for a new access + refresh token pair.  
 The old refresh token is consumed atomically and revoked immediately.
+Each login starts a separate refresh-token family; rotation preserves that family.
+Reusing any revoked member invalidates all still-active refresh tokens in that
+family, including descendants of later rotations, without affecting other logins
+or users. A revoked member remains replay evidence even after its expiry.
+
+**Concurrency policy (fail-closed):** two exchanges using the same token produce
+one `200` and one `401`. The second exchange is treated as reuse and invalidates
+the family, including the refresh token returned by the successful exchange.
+Clients must serialize refresh requests; there is no retry grace window. A new
+login is required after this race. Rotation, descendant insertion, and replay
+revocation use SQLite write transactions to prevent a surviving descendant.
+
+**Access-token limitation:** family revocation does **not** revoke already issued
+access JWTs. They remain valid until their 15-minute expiry, unless their specific
+JTI is explicitly blocklisted by logout. The API does not track access JWTs by
+family; the successful concurrent exchange's access JWT therefore remains valid.
 
 ```bash
 curl -s -X POST http://localhost:5000/refresh \
@@ -157,6 +174,7 @@ already-revoked or another user's refresh token does not reveal token ownership:
 the authenticated caller receives `204`.
 
 Access-token revocation is process-local, not durable or shared between replicas.
+Logout does not revoke the entire refresh-token family or other access JWTs.
 
 ```bash
 curl -s -X POST http://localhost:5000/logout \
@@ -243,7 +261,7 @@ curl -s -o /dev/null -w "%{http_code}" http://localhost:5000/me \
 | JWT validation | Issuer, audience, lifetime, signature — `ClockSkew = Zero` |
 | Token revocation | Access token JTI blocklisted on logout; refresh token revoked in DB |
 | Refresh token storage | Opaque refresh tokens are HMAC-SHA256 hashed before persistence |
-| Refresh token rotation | Old token is consumed via conditional `UPDATE ... RETURNING`; replayed tokens are rejected |
+| Refresh token rotation | Conditional `UPDATE ... RETURNING`, preserved login family, atomic descendant revocation on replay (fail-closed) |
 | Brute force | Rate limiter: 10 requests/min per IP on all auth endpoints (sliding window, 429 on breach) |
 | Refresh token format | 64-byte CSPRNG, URL-safe base64, returned once to the client |
 | SQLite integrity | Foreign keys are enabled per connection |
@@ -260,6 +278,13 @@ curl -s -o /dev/null -w "%{http_code}" http://localhost:5000/me \
 - Refresh-token migration invalidates legacy plain-text refresh tokens if an old
   database is detected. Users must log in again, which is safer than preserving
   reusable secrets.
+- The additive `family_id` migration runs after the existing schema migration,
+  backfills a distinct family per historical row, and preserves current hashed
+  tokens and their expiry/revocation state. It is idempotent. Historical lineage
+  cannot be recovered: pre-upgrade ancestors cannot invalidate descendants that
+  were already created before the upgrade. Rotation after upgrade retains the
+  backfilled family. Stop old application instances before upgrading; mixed
+  versions writing tokens without family IDs are not supported.
 - Rate limiting is IP-based. Behind a reverse proxy, configure forwarded headers
   for trusted proxies only and consider adding account-based throttling. Limits
   are process-local. Password reset, email verification, MFA and distributed
