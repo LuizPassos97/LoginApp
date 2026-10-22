@@ -78,17 +78,19 @@ public sealed class Database
         if (await RefreshTokenTableHasColumnAsync(conn, "token_hash"))
             return;
 
-        await using var disableForeignKeys = conn.CreateCommand();
-        disableForeignKeys.CommandText = "PRAGMA foreign_keys = OFF;";
-        await disableForeignKeys.ExecuteNonQueryAsync();
+        // SQLite rolls back both DDL and copied rows if any migration step fails.
+        // Keep foreign keys enabled so invalid legacy references abort the migration.
+        await using var transaction = conn.BeginTransaction();
 
         await using var rename = conn.CreateCommand();
+        rename.Transaction = transaction;
         rename.CommandText = "ALTER TABLE refresh_tokens RENAME TO refresh_tokens_legacy;";
         await rename.ExecuteNonQueryAsync();
 
-        await CreateRefreshTokenTableAsync(conn);
+        await CreateRefreshTokenTableAsync(conn, transaction);
 
         await using var migrate = conn.CreateCommand();
+        migrate.Transaction = transaction;
         migrate.CommandText = """
             INSERT INTO refresh_tokens (user_id, token_hash, expires_at, revoked_at, created_at)
             SELECT user_id,
@@ -101,17 +103,17 @@ public sealed class Database
         await migrate.ExecuteNonQueryAsync();
 
         await using var dropLegacy = conn.CreateCommand();
+        dropLegacy.Transaction = transaction;
         dropLegacy.CommandText = "DROP TABLE refresh_tokens_legacy;";
         await dropLegacy.ExecuteNonQueryAsync();
 
-        await using var enableForeignKeys = conn.CreateCommand();
-        enableForeignKeys.CommandText = "PRAGMA foreign_keys = ON;";
-        await enableForeignKeys.ExecuteNonQueryAsync();
+        await transaction.CommitAsync();
     }
 
-    private static async Task CreateRefreshTokenTableAsync(SqliteConnection conn)
+    private static async Task CreateRefreshTokenTableAsync(SqliteConnection conn, SqliteTransaction? transaction = null)
     {
         await using var cmdTokens = conn.CreateCommand();
+        cmdTokens.Transaction = transaction;
         cmdTokens.CommandText = """
             CREATE TABLE IF NOT EXISTS refresh_tokens (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
