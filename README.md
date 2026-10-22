@@ -24,7 +24,7 @@ security boundaries inspectable without Docker or external services.
 - **Runtime**: .NET 10 Minimal APIs
 - **Database**: SQLite via `Microsoft.Data.Sqlite` (raw SQL, no ORM)
 - **Auth**: JWT via `System.IdentityModel.Tokens.Jwt` + `Microsoft.AspNetCore.Authentication.JwtBearer`
-- **Password hashing**: PBKDF2 (`Rfc2898DeriveBytes`, SHA-256, 100 000 iterations, 32-byte salt + hash)
+- **Password hashing**: versioned PBKDF2-SHA256, 600 000 iterations, 32-byte random salt and hash
 - **Tests**: xUnit integration tests via `Microsoft.AspNetCore.Mvc.Testing`
 - **CI**: GitHub Actions for dependency audit, restore, build, tests and coverage gates
 
@@ -36,6 +36,19 @@ security boundaries inspectable without Docker or external services.
 - `Services/JwtSecretValidator.cs`: startup validation for unsafe JWT secrets
 - `Data/Database.cs`: SQLite connection handling, schema creation, foreign keys, and legacy token migration
 - `LoginApp.Tests/`: integration and security-focused tests with coverage enforcement
+
+```mermaid
+flowchart LR
+    client[Client] --> api[Minimal API / auth / rate limit]
+    api --> service[AuthService]
+    service --> db[(SQLite: users and refresh-token families)]
+    api --> blocklist[Process-local access JTI blocklist]
+```
+
+SQLite is deliberate: real SQL, constraints and write transactions keep the
+concurrency guarantees visible and the project runnable without infrastructure.
+Minimal APIs keep the small HTTP surface straightforward; tests exercise requests
+through `WebApplicationFactory` rather than mocking the database.
 
 ## How to run
 
@@ -95,6 +108,9 @@ The integration and unit tests use an isolated SQLite database per test factory 
 - required payload validation and duplicate registration
 - legacy refresh-token schema migration
 - JWT secret validation and token blocklist expiry behavior
+- rollback and retry of failed legacy migrations, including invalid foreign keys
+- versioned password hashes, successful legacy rehash and unchanged state after failed logins
+- native SQLite version baseline for CVE-2025-6965
 
 ---
 
@@ -254,18 +270,29 @@ curl -s -o /dev/null -w "%{http_code}" http://localhost:5000/me \
 
 | Concern | Implementation |
 |---|---|
-| Password storage | PBKDF2-SHA256, 100 000 iterations, 32-byte random salt per user |
+| Password storage | Versioned PBKDF2-SHA256, 600 000 iterations, 32-byte random salt per user |
 | Timing-safe compare | `CryptographicOperations.FixedTimeEquals` |
-| User enumeration | Login always runs full PBKDF2 before returning 401, same response for unknown email vs wrong password |
+| Login failures | Same 401 response; current and unknown users pay 600 000 PBKDF2 iterations; failed legacy checks add 500 000 iterations after their original 100 000 |
 | SQL injection | Parameterized queries everywhere, zero string interpolation |
 | JWT validation | Issuer, audience, lifetime, signature — `ClockSkew = Zero` |
 | Token revocation | Access token JTI blocklisted on logout; refresh token revoked in DB |
 | Refresh token storage | Opaque refresh tokens are HMAC-SHA256 hashed before persistence |
 | Refresh token rotation | Conditional `UPDATE ... RETURNING`, preserved login family, atomic descendant revocation on replay (fail-closed) |
-| Brute force | Rate limiter: 10 requests/min per IP on all auth endpoints (sliding window, 429 on breach) |
+| Brute force | Rate limiter: 10 requests/min per IP across register, login and refresh (sliding window, 429 on breach) |
 | Refresh token format | 64-byte CSPRNG, URL-safe base64, returned once to the client |
 | SQLite integrity | Foreign keys are enabled per connection |
-| Config safety | Startup rejects weak/default JWT secrets and production dev secrets |
+| Config safety | Startup enforces a minimum JWT key length, rejects the scaffold placeholder and production DEV_ONLY markers; use random keys, not length alone |
+
+The password work factor follows the [OWASP PBKDF2-SHA256 recommendation](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html#pbkdf2).
+The prefix `pbkdf2-sha256$600000$` records the supported format and cost. Existing
+unversioned 100 000-iteration hashes remain verifiable and are upgraded with a new
+salt only after a successful login, using a conditional update to avoid overwrites.
+The work factor is fixed in code, not an arbitrary request/configuration value.
+Benchmark it on deployment hardware before changing it; do not reduce it simply
+to improve request throughput. Equalized derivation work mitigates the obvious
+legacy timing gap but is not a constant-time guarantee for the complete endpoint.
+That cost policy covers valid stored hash/salt formats; malformed database records
+are rejected but may return earlier through the error path.
 
 ## Design trade-offs
 
@@ -277,7 +304,9 @@ curl -s -o /dev/null -w "%{http_code}" http://localhost:5000/me \
   repository/service boundaries can move to PostgreSQL or SQL Server.
 - Refresh-token migration invalidates legacy plain-text refresh tokens if an old
   database is detected. Users must log in again, which is safer than preserving
-  reusable secrets.
+  reusable secrets. Rename, table creation, copy and cleanup are transactional;
+  invalid rows cause rollback rather than a partially migrated schema. Repair
+  inconsistent data before retrying startup and back up real data before upgrading.
 - The additive `family_id` migration runs after the existing schema migration,
   backfills a distinct family per historical row, and preserves current hashed
   tokens and their expiry/revocation state. It is idempotent. Historical lineage
