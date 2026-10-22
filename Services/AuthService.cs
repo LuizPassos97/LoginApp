@@ -19,6 +19,9 @@ public class AuthService
 
     private static readonly TimeSpan AccessTokenLifetime = TimeSpan.FromMinutes(15);
     private static readonly TimeSpan RefreshTokenLifetime = TimeSpan.FromDays(30);
+    private const int PasswordIterations = 600_000;
+    private const int LegacyPasswordIterations = 100_000;
+    private const string PasswordHashPrefix = "pbkdf2-sha256$600000$";
 
     public AuthService(IConfiguration config, Database db)
     {
@@ -60,15 +63,30 @@ public class AuthService
     {
         var user = await FindUserByEmailAsync(email);
 
-        // Always run PBKDF2 to prevent timing-based user enumeration.
-        // When the user doesn't exist, verify against a dummy hash so execution
-        // time is indistinguishable from a real failed attempt.
-        var hashToVerify = user?.PasswordHash ?? Convert.ToBase64String(new byte[32]);
+        // Unknown users still pay the current PBKDF2 cost. Legacy hashes are
+        // verified at their old cost and upgraded only after a successful login.
+        var hashToVerify = user?.PasswordHash ?? PasswordHashPrefix + Convert.ToBase64String(new byte[32]);
         var saltToVerify = user?.PasswordSalt ?? Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
         var passwordValid = VerifyPassword(password, hashToVerify, saltToVerify);
 
         if (user is null || !passwordValid)
             return (false, string.Empty, string.Empty, "Invalid credentials.");
+
+        if (!user.PasswordHash.StartsWith(PasswordHashPrefix, StringComparison.Ordinal))
+        {
+            var (hash, salt) = HashPassword(password);
+            await using var conn = await _db.OpenConnectionAsync();
+            await using var upgrade = conn.CreateCommand();
+            upgrade.CommandText = """
+                UPDATE users SET password_hash = @hash, password_salt = @salt
+                WHERE id = @id AND password_hash = @previousHash;
+                """;
+            upgrade.Parameters.AddWithValue("@hash", hash);
+            upgrade.Parameters.AddWithValue("@salt", salt);
+            upgrade.Parameters.AddWithValue("@id", user.Id);
+            upgrade.Parameters.AddWithValue("@previousHash", user.PasswordHash);
+            await upgrade.ExecuteNonQueryAsync();
+        }
 
         var accessToken = GenerateAccessToken(user);
         var refreshToken = await CreateRefreshTokenAsync(user.Id);
@@ -217,8 +235,8 @@ public class AuthService
     {
         var saltBytes = RandomNumberGenerator.GetBytes(32);
         var hashBytes = Rfc2898DeriveBytes.Pbkdf2(
-            password, saltBytes, 100_000, HashAlgorithmName.SHA256, outputLength: 32);
-        return (Convert.ToBase64String(hashBytes), Convert.ToBase64String(saltBytes));
+            password, saltBytes, PasswordIterations, HashAlgorithmName.SHA256, outputLength: 32);
+        return (PasswordHashPrefix + Convert.ToBase64String(hashBytes), Convert.ToBase64String(saltBytes));
     }
 
     private static bool VerifyPassword(string password, string storedHash, string storedSalt)
@@ -226,9 +244,34 @@ public class AuthService
         try
         {
             var saltBytes = Convert.FromBase64String(storedSalt);
+            var current = storedHash.StartsWith(PasswordHashPrefix, StringComparison.Ordinal);
+            var encodedHash = current ? storedHash[PasswordHashPrefix.Length..] : storedHash;
             var hashBytes = Rfc2898DeriveBytes.Pbkdf2(
-                password, saltBytes, 100_000, HashAlgorithmName.SHA256, outputLength: 32);
-            return CryptographicOperations.FixedTimeEquals(hashBytes, Convert.FromBase64String(storedHash));
+                password, saltBytes, current ? PasswordIterations : LegacyPasswordIterations, HashAlgorithmName.SHA256, outputLength: 32);
+            try
+            {
+                var valid = CryptographicOperations.FixedTimeEquals(hashBytes, Convert.FromBase64String(encodedHash));
+                if (!current && !valid)
+                {
+                    // Match the current failed-login cost without changing legacy verification.
+                    Span<byte> padding = stackalloc byte[32];
+                    try
+                    {
+                        Rfc2898DeriveBytes.Pbkdf2(password.AsSpan(), saltBytes, padding,
+                            PasswordIterations - LegacyPasswordIterations, HashAlgorithmName.SHA256);
+                        _ = CryptographicOperations.FixedTimeEquals(padding, hashBytes);
+                    }
+                    finally
+                    {
+                        CryptographicOperations.ZeroMemory(padding);
+                    }
+                }
+                return valid;
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(hashBytes);
+            }
         }
         catch
         {
