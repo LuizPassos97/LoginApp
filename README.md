@@ -2,9 +2,10 @@
 
 ![CI](https://github.com/LuizPassos97/LoginApp/actions/workflows/ci.yml/badge.svg)
 ![.NET](https://img.shields.io/badge/.NET-10.0-512BD4)
-![Coverage](https://img.shields.io/badge/coverage-97.87%25%20lines%20%7C%2087.76%25%20branches-brightgreen)
+![Coverage gate](https://img.shields.io/badge/coverage_gate-85%25_lines_and_branches-brightgreen)
+![License](https://img.shields.io/badge/license-MIT-blue)
 
-A minimal, secure login system built with .NET 10 Minimal APIs, SQLite, and JWT.
+A focused authentication reference project built with .NET 10 Minimal APIs, SQLite, and JWT.
 It intentionally avoids ASP.NET Identity so the auth flow, storage model, and
 security trade-offs are visible in the code.
 
@@ -14,14 +15,18 @@ This project demonstrates a security-conscious authentication flow implemented
 without ASP.NET Identity, focusing on explicit token lifecycle, refresh-token
 rotation, testability, and operational trade-offs.
 
+It is a backend portfolio project, not a replacement for a maintained identity
+provider. The implementation makes database concurrency, token ownership and
+security boundaries inspectable without Docker or external services.
+
 ## Stack
 
 - **Runtime**: .NET 10 Minimal APIs
 - **Database**: SQLite via `Microsoft.Data.Sqlite` (raw SQL, no ORM)
 - **Auth**: JWT via `System.IdentityModel.Tokens.Jwt` + `Microsoft.AspNetCore.Authentication.JwtBearer`
-- **Password hashing**: PBKDF2 (`Rfc2898DeriveBytes`, SHA-256, 100 000 iterations, 32-byte salt + hash)
+- **Password hashing**: versioned PBKDF2-SHA256, 600 000 iterations, 32-byte random salt and hash
 - **Tests**: xUnit integration tests via `Microsoft.AspNetCore.Mvc.Testing`
-- **CI**: GitHub Actions workflow for restore, build, and test
+- **CI**: GitHub Actions for dependency audit, restore, build, tests and coverage gates
 
 ## Architecture
 
@@ -32,22 +37,36 @@ rotation, testability, and operational trade-offs.
 - `Data/Database.cs`: SQLite connection handling, schema creation, foreign keys, and legacy token migration
 - `LoginApp.Tests/`: integration and security-focused tests with coverage enforcement
 
+```mermaid
+flowchart LR
+    client[Client] --> api[Minimal API / auth / rate limit]
+    api --> service[AuthService]
+    service --> db[(SQLite: users and refresh-token families)]
+    api --> blocklist[Process-local access JTI blocklist]
+```
+
+SQLite is deliberate: real SQL, constraints and write transactions keep the
+concurrency guarantees visible and the project runnable without infrastructure.
+Minimal APIs keep the small HTTP surface straightforward; tests exercise requests
+through `WebApplicationFactory` rather than mocking the database.
+
 ## How to run
 
+Requirements: the .NET 10 SDK. No Docker, database server or paid service is required.
+
 ```bash
+export Jwt__Secret="$(openssl rand -hex 32)"
+export ASPNETCORE_URLS=http://localhost:5000
 dotnet run --project LoginApp.csproj
 ```
 
 The server starts on `http://localhost:5000`.  
 The SQLite database (`loginapp.db`) is created automatically on first run.
 
-The checked-in JWT secret is development-only. Production startup fails if the
-secret still looks like a dev value; override it with an environment variable,
-user secret, or managed secret store:
-
-```bash
-Jwt__Secret="replace-with-a-cryptographically-random-secret" dotnet run --project LoginApp.csproj
-```
+The checked-in JWT value is development-only. The commands above generate a fresh
+key without printing it. Keep that key stable between restarts if tokens must
+remain usable. For a real deployment, use protected secret storage, TLS and a
+persistent database path. Do not expose the development HTTP listener publicly.
 
 ## Tests
 
@@ -61,8 +80,19 @@ Coverage can be collected locally with:
 dotnet test LoginApp.slnx --configuration Release --collect:"XPlat Code Coverage"
 ```
 
-Current measured coverage: **97.87% line coverage** and **87.76% branch coverage**.
-The CI enforces a minimum of 85% for both lines and branches.
+CI enforces a minimum of **85% for both lines and branches**. The badge describes
+that enforced gate, not a manually maintained measurement. Reproduce the same gate:
+
+```bash
+dotnet test LoginApp.slnx --configuration Release \
+  /p:CollectCoverage=true /p:CoverletOutputFormat=cobertura \
+  /p:Threshold=85 /p:ThresholdType=line%2cbranch
+dotnet list LoginApp.slnx package --vulnerable --include-transitive
+```
+
+CI audits direct and transitive NuGet dependencies and treats reported
+vulnerabilities and audit-source warnings as errors. A clear audit only means no
+known vulnerable package was reported by the consulted sources at that time.
 
 The integration and unit tests use an isolated SQLite database per test factory and cover:
 
@@ -78,6 +108,9 @@ The integration and unit tests use an isolated SQLite database per test factory 
 - required payload validation and duplicate registration
 - legacy refresh-token schema migration
 - JWT secret validation and token blocklist expiry behavior
+- rollback and retry of failed legacy migrations, including invalid foreign keys
+- versioned password hashes, successful legacy rehash and unchanged state after failed logins
+- native SQLite version baseline for CVE-2025-6965
 
 ---
 
@@ -112,7 +145,8 @@ curl -s -X POST http://localhost:5000/login \
 }
 ```
 
-**401** — same response for unknown email or wrong password (no enumeration)
+**401** — same response for unknown email or wrong password; this is not a guarantee
+of identical end-to-end timing.
 
 ---
 
@@ -150,12 +184,13 @@ curl -s -X POST http://localhost:5000/refresh \
 
 ### `POST /logout`
 
-Blocklists the current access token and revokes the refresh token.  
-Both are immediately invalid — no waiting for expiry.
-Only the supplied refresh token belonging to the authenticated user is revoked;
-logout does not revoke the entire family or other access JWTs. A null, nonexistent,
-already revoked, or another user's refresh token still returns `204` and blocks
-the caller's access JWT, without revoking another user's refresh token.
+Blocklists the caller's current access token in this running process and revokes
+the supplied refresh token only when it belongs to the caller. Missing, unknown,
+already-revoked or another user's refresh token does not reveal token ownership:
+the authenticated caller receives `204`.
+
+Access-token revocation is process-local, not durable or shared between replicas.
+Logout does not revoke the entire refresh-token family or other access JWTs.
 
 ```bash
 curl -s -X POST http://localhost:5000/logout \
@@ -217,7 +252,7 @@ NEW=$(curl -s -X POST http://localhost:5000/refresh \
 NEW_ACCESS=$(echo $NEW | grep -o '"accessToken":"[^"]*"' | cut -d'"' -f4)
 NEW_REFRESH=$(echo $NEW | grep -o '"refreshToken":"[^"]*"' | cut -d'"' -f4)
 
-# 5. Logout — invalidates both tokens immediately
+# 5. Logout — blocklists access in this process and persists refresh revocation
 curl -s -X POST http://localhost:5000/logout \
   -H "Authorization: Bearer $NEW_ACCESS" \
   -H "Content-Type: application/json" \
@@ -235,29 +270,43 @@ curl -s -o /dev/null -w "%{http_code}" http://localhost:5000/me \
 
 | Concern | Implementation |
 |---|---|
-| Password storage | PBKDF2-SHA256, 100 000 iterations, 32-byte random salt per user |
+| Password storage | Versioned PBKDF2-SHA256, 600 000 iterations, 32-byte random salt per user |
 | Timing-safe compare | `CryptographicOperations.FixedTimeEquals` |
-| User enumeration | Login always runs full PBKDF2 before returning 401, same response for unknown email vs wrong password |
+| Login failures | Same 401 response; current and unknown users pay 600 000 PBKDF2 iterations; failed legacy checks add 500 000 iterations after their original 100 000 |
 | SQL injection | Parameterized queries everywhere, zero string interpolation |
 | JWT validation | Issuer, audience, lifetime, signature — `ClockSkew = Zero` |
 | Token revocation | Access token JTI blocklisted on logout; refresh token revoked in DB |
 | Refresh token storage | Opaque refresh tokens are HMAC-SHA256 hashed before persistence |
 | Refresh token rotation | Conditional `UPDATE ... RETURNING`, preserved login family, atomic descendant revocation on replay (fail-closed) |
-| Brute force | Rate limiter: 10 requests/min per IP on all auth endpoints (sliding window, 429 on breach) |
+| Brute force | Rate limiter: 10 requests/min per IP across register, login and refresh (sliding window, 429 on breach) |
 | Refresh token format | 64-byte CSPRNG, URL-safe base64, returned once to the client |
 | SQLite integrity | Foreign keys are enabled per connection |
-| Config safety | Startup rejects weak/default JWT secrets and production dev secrets |
+| Config safety | Startup enforces a minimum JWT key length, rejects the scaffold placeholder and production DEV_ONLY markers; use random keys, not length alone |
+
+The password work factor follows the [OWASP PBKDF2-SHA256 recommendation](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html#pbkdf2).
+The prefix `pbkdf2-sha256$600000$` records the supported format and cost. Existing
+unversioned 100 000-iteration hashes remain verifiable and are upgraded with a new
+salt only after a successful login, using a conditional update to avoid overwrites.
+The work factor is fixed in code, not an arbitrary request/configuration value.
+Benchmark it on deployment hardware before changing it; do not reduce it simply
+to improve request throughput. Equalized derivation work mitigates the obvious
+legacy timing gap but is not a constant-time guarantee for the complete endpoint.
+That cost policy covers valid stored hash/salt formats; malformed database records
+are rejected but may return earlier through the error path.
 
 ## Design trade-offs
 
-- The access-token blocklist is in-memory. That is fine for this small single-node
-  app, but a real multi-instance deployment should use Redis or another shared
-  store.
+- The access-token blocklist is in-memory. Restarting the process loses it, and
+  another replica does not see it. A previously blocklisted access token can then
+  be accepted until its 15-minute expiry. Durable, shared revocation would be a
+  separate deployment requirement; this project does not implement it.
 - SQLite keeps the project easy to run locally. For production, the same
   repository/service boundaries can move to PostgreSQL or SQL Server.
 - Refresh-token migration invalidates legacy plain-text refresh tokens if an old
   database is detected. Users must log in again, which is safer than preserving
-  reusable secrets.
+  reusable secrets. Rename, table creation, copy and cleanup are transactional;
+  invalid rows cause rollback rather than a partially migrated schema. Repair
+  inconsistent data before retrying startup and back up real data before upgrading.
 - The additive `family_id` migration runs after the existing schema migration,
   backfills a distinct family per historical row, and preserves current hashed
   tokens and their expiry/revocation state. It is idempotent. Historical lineage
@@ -266,4 +315,10 @@ curl -s -o /dev/null -w "%{http_code}" http://localhost:5000/me \
   backfilled family. Stop old application instances before upgrading; mixed
   versions writing tokens without family IDs are not supported.
 - Rate limiting is IP-based. Behind a reverse proxy, configure forwarded headers
-  and consider adding account-based throttling.
+  for trusted proxies only and consider adding account-based throttling. Limits
+  are process-local. Password reset, email verification, MFA and distributed
+  session management are outside this project's scope.
+
+## License
+
+[MIT](LICENSE).
