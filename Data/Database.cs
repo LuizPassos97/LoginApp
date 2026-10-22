@@ -42,6 +42,29 @@ public sealed class Database
         await cmdUsers.ExecuteNonQueryAsync();
 
         await EnsureRefreshTokenSchemaAsync(conn);
+        await EnsureRefreshTokenFamilySchemaAsync(conn);
+    }
+
+    private static async Task EnsureRefreshTokenFamilySchemaAsync(SqliteConnection conn)
+    {
+        await using var tx = conn.BeginTransaction();
+        if (!await RefreshTokenTableHasColumnAsync(conn, "family_id"))
+        {
+            await using var alter = conn.CreateCommand();
+            alter.Transaction = tx;
+            alter.CommandText = "ALTER TABLE refresh_tokens ADD COLUMN family_id TEXT NOT NULL DEFAULT '';";
+            await alter.ExecuteNonQueryAsync();
+        }
+
+        // Historical lineage cannot be reconstructed: isolate each existing token.
+        await using var backfill = conn.CreateCommand();
+        backfill.Transaction = tx;
+        backfill.CommandText = """
+            UPDATE refresh_tokens SET family_id = lower(hex(randomblob(16))) WHERE family_id = '';
+            CREATE INDEX IF NOT EXISTS ix_refresh_tokens_family ON refresh_tokens(user_id, family_id);
+            """;
+        await backfill.ExecuteNonQueryAsync();
+        await tx.CommitAsync();
     }
 
     private static async Task EnsureRefreshTokenSchemaAsync(SqliteConnection conn)
